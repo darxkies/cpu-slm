@@ -1,9 +1,9 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use std::collections::HashMap;
 
 pub const UNKNOWN_TOKEN: &str = "<unk>";
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TokenizerType {
     GPT2,
     LLAMA,
@@ -22,9 +22,50 @@ pub struct BPETokenizer {
     pub add_space_prefix: bool,
     pub add_begin_of_sequence_token: bool,
     pub add_end_of_sequence_token: bool,
+
+    gpt2_bytes_to_unicode: Option<HashMap<u8, char>>,
+    gpt2_unicode_to_bytes: Option<HashMap<char, u8>>,
 }
 
 impl BPETokenizer {
+    fn gpt2_bytes_to_unicode_tables() -> (HashMap<u8, char>, HashMap<char, u8>) {
+        let mut bytes_that_map_to_themselves: Vec<u32> = Vec::new();
+
+        bytes_that_map_to_themselves.extend(33u32..=126u32);
+        bytes_that_map_to_themselves.extend(161u32..=172u32);
+        bytes_that_map_to_themselves.extend(174u32..=255u32);
+
+        let mut unicode_code_points: Vec<u32> = bytes_that_map_to_themselves.clone();
+
+        let mut count: u32 = 0;
+
+        for byte in 0u32..=255u32 {
+            if !bytes_that_map_to_themselves.contains(&byte) {
+                bytes_that_map_to_themselves.push(byte);
+
+                unicode_code_points.push(256 + count);
+
+                count += 1;
+            }
+        }
+
+        let mut byte_to_unicode: HashMap<u8, char> = HashMap::with_capacity(256);
+        let mut unicode_to_byte: HashMap<char, u8> = HashMap::with_capacity(256);
+
+        for (byte, code) in bytes_that_map_to_themselves
+            .into_iter()
+            .zip(unicode_code_points.into_iter())
+        {
+            let char = char::from_u32(code).expect("valid unicode scalar value");
+
+            byte_to_unicode.insert(byte as u8, char);
+
+            unicode_to_byte.insert(char, byte as u8);
+        }
+
+        (byte_to_unicode, unicode_to_byte)
+    }
+
     pub fn new(
         r#type: TokenizerType,
         tokens: Vec<String>,
@@ -37,108 +78,111 @@ impl BPETokenizer {
         add_begin_of_sequence_token: bool,
         add_end_of_sequence_token: bool,
     ) -> Result<Self> {
-        fn decode(string: String) -> String {
-            string
-                .chars()
-                .filter_map(|char| {
-                    let char = char as u32;
-
-                    char::from_u32(if (256..298).contains(&char) {
-                        char - 256
-                    } else if (289..323).contains(&char) {
-                        char - 256 + 127 - 161
-                    } else {
-                        char
-                    })
-                })
-                .collect()
-        }
+        let id_to_token = tokens;
 
         let token_to_id = HashMap::from_iter(
-            tokens
-                .clone()
-                .into_iter()
+            id_to_token
+                .iter()
+                .cloned()
                 .enumerate()
                 .map(|(index, value)| (value, index as u32)),
         );
 
-        let tokens = tokens
-            .into_iter()
-            .map(|string| {
-                if r#type == TokenizerType::GPT2 {
-                    decode(string)
-                } else {
-                    string
-                }
-            })
-            .collect::<Vec<_>>();
-
         let special_tokens = token_type
             .iter()
             .enumerate()
-            .filter(|(_, token_type)| **token_type == 3 || **token_type == 4)
-            .map(|(index, _)| tokens[index].clone())
+            .filter(|(_, token)| **token == 3 || **token == 4)
+            .map(|(index, _)| {
+                id_to_token
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| UNKNOWN_TOKEN.to_string())
+            })
             .collect::<Vec<_>>();
 
-        //println!("special tokens: {special_tokens:?}");
+        let (gpt2_bytes_to_unicode, gpt2_unicode_to_bytes) = if r#type == TokenizerType::GPT2 {
+            let (bytes_to_unicode, unicode_to_bytes) = Self::gpt2_bytes_to_unicode_tables();
+
+            (Some(bytes_to_unicode), Some(unicode_to_bytes))
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             r#type,
             token_to_id,
-            id_to_token: tokens,
-            special_tokens,
-            token_type,
+            id_to_token,
             merges: HashMap::from_iter(
                 merges
                     .into_iter()
                     .enumerate()
                     .map(|(index, (first, second))| ((first, second), index as u32)),
             ),
-            scores,
+            token_type,
             begin_of_sequence_token_identifier,
             end_of_sequence_token_identifier,
+            special_tokens,
+            scores,
             add_space_prefix,
             add_begin_of_sequence_token,
             add_end_of_sequence_token,
+            gpt2_bytes_to_unicode,
+            gpt2_unicode_to_bytes,
         })
     }
 
-    pub fn encode_gpt2(&self, text: &str) -> Result<Vec<u32>> {
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        match self.r#type {
+            TokenizerType::GPT2 => self.encode_gpt2(text),
+            TokenizerType::LLAMA => self.encode_llama(text),
+        }
+    }
+
+    pub fn decode(&self, ids: &[u32]) -> Result<String> {
+        match self.r#type {
+            TokenizerType::GPT2 => self.decode_gpt2(ids),
+            TokenizerType::LLAMA => Ok(self.decode_llama(ids)),
+        }
+    }
+
+    pub fn decode_token(&self, id: u32) -> String {
+        self.id_to_token
+            .get(id as usize)
+            .cloned()
+            .unwrap_or_else(|| UNKNOWN_TOKEN.to_string())
+    }
+
+    fn encode_gpt2(&self, text: &str) -> Result<Vec<u32>> {
         let mut text = text.to_string();
 
         if self.add_space_prefix {
             text.insert(0, ' ');
         }
 
-        let mut ids: Vec<u32> = Vec::new();
+        let byte_to_unicode = self
+            .gpt2_bytes_to_unicode
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing GPT2 bytes_to_unicode mapping"))?;
 
         let mut pieces: Vec<String> = text
             .as_bytes()
             .iter()
             .map(|&byte| {
-                let mut value = byte as u32;
+                let char = *byte_to_unicode.get(&byte).expect("all bytes mapped");
 
-                if value < 33 {
-                    value += 256;
-                } else if value >= 127 && value < 161 {
-                    value = value + 256 - 127 + 161;
-                }
-
-                char::from_u32(value)
-                    .map(|char| char.to_string())
-                    .unwrap_or_else(|| format!("<0x{:02X}>", byte))
+                char.to_string()
             })
             .collect();
 
+        // Collapse special tokens first.
         for special_token in &self.special_tokens {
             let tokens = special_token
                 .chars()
-                .map(|char| char.to_string())
+                .map(|ch| ch.to_string())
                 .collect::<Vec<String>>();
 
             loop {
                 let mut found = None;
-
                 for i in 0..=pieces.len().saturating_sub(tokens.len()) {
                     if tokens[..] == pieces[i..i + tokens.len()] {
                         found = Some(i);
@@ -155,9 +199,9 @@ impl BPETokenizer {
             }
         }
 
+        // Merge loop
         if pieces.len() > 1 {
             loop {
-                // Find the best merge (lowest rank) among adjacent pairs.
                 let mut best_rank: Option<f32> = None;
                 let mut best_index: usize = 0;
 
@@ -165,21 +209,20 @@ impl BPETokenizer {
                     let left = &pieces[i];
                     let right = &pieces[i + 1];
 
-                    let rank = if self.merges.is_empty() {
+                    let rank = if !self.merges.is_empty() {
+                        self.merges
+                            .get(&(left.clone(), right.clone()))
+                            .map(|value| *value as f32)
+                    } else {
                         let mut buffer = String::new();
-
                         buffer.push_str(left);
                         buffer.push_str(right);
 
                         if let Some(id) = self.token_to_id.get(&buffer) {
-                            self.scores.get(*id as usize).map(|value| *value)
+                            self.scores.get(*id as usize).copied()
                         } else {
                             None
                         }
-                    } else {
-                        self.merges
-                            .get(&(left.clone(), right.clone()))
-                            .map(|value| *value as f32)
                     };
 
                     if let Some(rank) = rank {
@@ -198,12 +241,10 @@ impl BPETokenizer {
                     }
                 }
 
-                // No merge found, stop.
                 if best_rank.is_none() {
                     break;
                 }
 
-                // Merge the best pair.
                 let merged = format!("{}{}", pieces[best_index], pieces[best_index + 1]);
 
                 pieces[best_index] = merged;
@@ -216,6 +257,8 @@ impl BPETokenizer {
             }
         }
 
+        let mut ids: Vec<u32> = Vec::with_capacity(pieces.len());
+
         for piece in &pieces {
             let Some(id) = self.token_to_id.get(piece).copied() else {
                 bail!("unknown token {piece:?}");
@@ -227,27 +270,52 @@ impl BPETokenizer {
         Ok(ids)
     }
 
-    pub fn encode_llama(&self, text: &str) -> Result<Vec<u32>> {
-        let text = text.replace(" ", "▁");
+    fn decode_gpt2(&self, ids: &[u32]) -> Result<String> {
+        let unicode_to_byte = self
+            .gpt2_unicode_to_bytes
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing GPT2 unicode_to_bytes mapping"))?;
 
+        let mut encoded = String::new();
+
+        for &id in ids {
+            let token = self.decode_token(id);
+
+            encoded.push_str(&token);
+        }
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(encoded.len());
+
+        for ch in encoded.chars() {
+            if let Some(b) = unicode_to_byte.get(&ch) {
+                bytes.push(*b);
+            } else {
+                bytes.extend_from_slice(ch.to_string().as_bytes());
+            }
+        }
+
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn encode_llama(&self, text: &str) -> Result<Vec<u32>> {
+        let text = text.replace(' ', "▁");
         let mut ids: Vec<u32> = Vec::new();
 
-        for char in text.chars() {
-            let string = char.to_string();
+        for ch in text.chars() {
+            let s = ch.to_string();
 
-            match self.token_to_id.get(&string) {
+            match self.token_to_id.get(&s) {
                 Some(id) => ids.push(*id),
                 None => {
-                    for byte in string.as_bytes() {
-                        // special tokens after <unk>, <s>, and </s>
+                    for byte in s.as_bytes() {
+                        // Skip <unk>, <s>, </s>
                         ids.push(*byte as u32 + 3);
                     }
                 }
             }
         }
 
-        //println!( "pieces: {:?}", ids.iter() .map(|id| self .id_to_token .get(*id as usize) .cloned() .unwrap_or_default()) .collect::<Vec<_>>());
-
+        // Collapse special tokens.
         for special_token in &self.special_tokens {
             let tokens = special_token
                 .chars()
@@ -278,21 +346,16 @@ impl BPETokenizer {
                 };
 
                 let Some(special_token_id) = self.token_to_id.get(special_token) else {
-                    bail!("special token {special_token:?} not found ");
+                    bail!("special token {special_token:?} not found");
                 };
 
-                ids.splice(
-                    position..position + tokens.len(),
-                    [special_token_id.clone()],
-                );
+                ids.splice(position..position + tokens.len(), [*special_token_id]);
             }
         }
 
-        //println!( "pieces: {:?}", ids.iter() .map(|id| self .id_to_token .get(*id as usize) .cloned() .unwrap_or_default()) .collect::<Vec<_>>());
-
+        // Merge loop using scores and full token lookup.
         if ids.len() > 1 {
             loop {
-                // Find the best merge (lowest rank) among adjacent pairs.
                 let mut best_rank: Option<f32> = None;
                 let mut best_index: usize = 0;
                 let mut best_id: u32 = 0;
@@ -312,7 +375,7 @@ impl BPETokenizer {
                     buffer.push_str(right);
 
                     if let Some(id) = self.token_to_id.get(&buffer) {
-                        if let Some(rank) = self.scores.get(*id as usize).map(|value| *value) {
+                        if let Some(rank) = self.scores.get(*id as usize).copied() {
                             match best_rank {
                                 None => {
                                     best_rank = Some(rank);
@@ -331,13 +394,11 @@ impl BPETokenizer {
                     }
                 }
 
-                // No merge found, stop.
                 if best_rank.is_none() {
                     break;
                 }
 
                 ids[best_index] = best_id;
-
                 ids.remove(best_index + 1);
 
                 if ids.len() < 2 {
@@ -347,76 +408,52 @@ impl BPETokenizer {
         }
 
         if self.add_begin_of_sequence_token {
-            if let Some(begin_of_sequence_token_identifier) =
-                self.begin_of_sequence_token_identifier
-            {
-                if ids
-                    .first()
-                    .is_none_or(|&first| first != begin_of_sequence_token_identifier)
-                {
-                    ids.insert(0, begin_of_sequence_token_identifier);
+            if let Some(bos) = self.begin_of_sequence_token_identifier {
+                if ids.first().is_none_or(|&first| first != bos) {
+                    ids.insert(0, bos);
                 }
+            }
+        }
+
+        if self.add_end_of_sequence_token {
+            if ids
+                .last()
+                .is_none_or(|&last| last != self.end_of_sequence_token_identifier)
+            {
+                ids.push(self.end_of_sequence_token_identifier);
             }
         }
 
         Ok(ids)
     }
 
-    pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        match self.r#type {
-            TokenizerType::GPT2 => self.encode_gpt2(text),
-            TokenizerType::LLAMA => self.encode_llama(text),
-        }
-    }
+    fn decode_llama(&self, ids: &[u32]) -> String {
+        let mut bytes: Vec<u8> = Vec::new();
 
-    pub fn decode_token_gpt2(&self, id: u32) -> String {
-        self.id_to_token
-            .get(id as usize)
-            .cloned()
-            .unwrap_or(UNKNOWN_TOKEN.to_string())
-    }
+        for &id in ids {
+            let piece = self
+                .id_to_token
+                .get(id as usize)
+                .cloned()
+                .unwrap_or_else(|| UNKNOWN_TOKEN.to_string());
 
-    pub fn decode_token_llama(&self, id: u32) -> String {
-        let piece = self
-            .id_to_token
-            .get(id as usize)
-            .cloned()
-            .unwrap_or(UNKNOWN_TOKEN.to_string());
+            let piece = piece.replace('▁', " ");
 
-        if let Some(value) = piece.strip_prefix("<0x") {
-            if let Some(value) = value.strip_suffix(">") {
-                if let Ok(byte) = usize::from_str_radix(&value, 16) {
-                    return match char::from_u32(byte as u32) {
-                        Some(value) => value.to_string(),
-                        None => piece,
-                    };
+            if let Some(hex) = piece
+                .strip_prefix("<0x")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    bytes.push(byte);
+
+                    continue;
                 }
             }
+
+            bytes.extend_from_slice(piece.as_bytes());
         }
 
-        piece.replace("▁", " ").to_string()
-    }
-
-    pub fn decode_token(&self, id: u32) -> String {
-        match self.r#type {
-            TokenizerType::GPT2 => self.decode_token_gpt2(id),
-            TokenizerType::LLAMA => self.decode_token_llama(id),
-        }
-    }
-
-    pub fn decode_tokens(&self, ids: &[u32]) -> Vec<String> {
-        ids.iter().map(|id| self.decode_token(*id)).collect()
-    }
-
-    pub fn decode(&self, ids: &[u32]) -> String {
-        let mut result = String::new();
-
-        for id in ids {
-            let token = self.decode_token(*id);
-
-            result.push_str(&token);
-        }
-
-        result
+        String::from_utf8_lossy(&bytes).to_string()
     }
 }
+

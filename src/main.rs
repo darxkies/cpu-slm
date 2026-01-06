@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
+
 mod gguf;
 mod math;
 pub mod model;
@@ -439,11 +440,11 @@ fn parse_subcommand() -> Result<Subcommand> {
 
         "inference" => {
             let (common, mut index) = parse_common_parameters(&arguments, 2)?;
-
             let mut user_prompt: Option<String> = None;
 
             while index < arguments.len() {
                 let flag = arguments[index].as_str();
+
                 match flag {
                     "--user-prompt" => {
                         let value =
@@ -508,15 +509,16 @@ fn run_inference(parameters: &InferenceParameters) -> Result<()> {
     let prompt = build_prompt_from_messages(parameters.common.prompt_format, &messages);
     let prompt_token_identifiers = model.tokenizer.encode(&prompt)?;
 
-    // Clear key value cache to ensure a clean run.
     model.transformer.state.key_value_cache.clear();
 
     let start_prompt = Instant::now();
+
     model.transformer.batched_forward(
         &prompt_token_identifiers,
         0,
         parameters.common.prompt_batch_size,
     )?;
+
     let stop_prompt = start_prompt.elapsed();
 
     let mut position = prompt_token_identifiers.len();
@@ -524,29 +526,38 @@ fn run_inference(parameters: &InferenceParameters) -> Result<()> {
 
     let start_generation = Instant::now();
 
-    let mut generated_text = String::new();
+    let mut generated_token_identifiers: Vec<u32> = Vec::new();
+    let mut printed_prefix_length_in_bytes: usize = 0;
 
     while position < maximum_sequence_length
         && position < prompt_token_identifiers.len() + parameters.common.maximum_generated_tokens
     {
         let next_token = sampler.sample_next_token(&mut model.transformer.state.logits);
 
-        let token = model.tokenizer.decode_token(next_token);
-        generated_text.push_str(&token);
+        generated_token_identifiers.push(next_token);
 
-        print!("{token}");
-        let _ = std::io::stdout().flush();
+        let decoded = model.tokenizer.decode(&generated_token_identifiers)?;
+        let decoded_bytes_len = decoded.as_bytes().len();
 
-        position += 1;
+        if decoded_bytes_len > printed_prefix_length_in_bytes {
+            let new_text = &decoded[printed_prefix_length_in_bytes..];
+
+            print!("{new_text}");
+
+            let _ = std::io::stdout().flush();
+
+            printed_prefix_length_in_bytes = decoded_bytes_len;
+        }
 
         if next_token == model.tokenizer.end_of_sequence_token_identifier {
             break;
         }
 
         model.transformer.forward(next_token, position)?;
+
+        position += 1;
     }
 
-    // Statistics
     {
         let prompt_seconds = (stop_prompt.as_millis() as f64) / 1000.0;
         let prompt_tokens_per_second = if prompt_seconds > 0.0 {
@@ -622,7 +633,6 @@ fn run_chat(parameters: &ChatParameters) -> Result<()> {
             content: user_line,
         });
 
-        // Build full prompt for all turns, then recompute from scratch for correctness.
         let prompt = build_prompt_from_messages(parameters.common.prompt_format, &messages);
         let prompt_token_identifiers = model.tokenizer.encode(&prompt)?;
 
@@ -644,7 +654,10 @@ fn run_chat(parameters: &ChatParameters) -> Result<()> {
         let _ = std::io::stdout().flush();
 
         let start_generation = Instant::now();
-        let mut assistant_text = String::new();
+
+        // Fix: collect generated token identifiers and decode them as a stream.
+        let mut generated_token_identifiers: Vec<u32> = Vec::new();
+        let mut printed_prefix_length_in_bytes: usize = 0;
 
         while position < maximum_sequence_length
             && position
@@ -652,29 +665,35 @@ fn run_chat(parameters: &ChatParameters) -> Result<()> {
         {
             let next_token = sampler.sample_next_token(&mut model.transformer.state.logits);
 
-            let token = model.tokenizer.decode_token(next_token);
-            assistant_text.push_str(&token);
+            generated_token_identifiers.push(next_token);
 
-            print!("{token}");
-            let _ = std::io::stdout().flush();
+            let decoded = model.tokenizer.decode(&generated_token_identifiers)?;
+            let decoded_bytes_len = decoded.as_bytes().len();
 
-            position += 1;
+            if decoded_bytes_len > printed_prefix_length_in_bytes {
+                let new_text = &decoded[printed_prefix_length_in_bytes..];
+                print!("{new_text}");
+                let _ = std::io::stdout().flush();
+                printed_prefix_length_in_bytes = decoded_bytes_len;
+            }
 
             if next_token == model.tokenizer.end_of_sequence_token_identifier {
                 break;
             }
 
             model.transformer.forward(next_token, position)?;
+            position += 1;
         }
 
         println!();
+
+        let assistant_text = model.tokenizer.decode(&generated_token_identifiers)?;
 
         messages.push(Message {
             role: Role::Assistant,
             content: assistant_text,
         });
 
-        // Optional statistics per turn
         {
             let prompt_seconds = (stop_prompt.as_millis() as f64) / 1000.0;
             let prompt_tokens_per_second = if prompt_seconds > 0.0 {
