@@ -361,6 +361,8 @@ impl Model {
             logits: vec![0f32; configuration.vocabulary_size as usize],
 
             key_value_cache,
+
+            cached_token_identifiers: vec![],
         };
 
         let tokens = if let Some(MetadataValue::StringArray(elements)) =
@@ -475,7 +477,7 @@ impl Model {
             state,
         };
 
-        println!("loaded model\n");
+        println!("model loaded\n---------------------------------");
 
         Ok(Model {
             transformer,

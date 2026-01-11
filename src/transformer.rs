@@ -2,6 +2,8 @@
 #![allow(unused_assignments)]
 #![allow(clippy::too_many_lines)]
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use rayon::prelude::*;
 
@@ -59,6 +61,24 @@ pub struct TransformerRuntimeState {
     pub logits: Vec<f32>,
 
     pub key_value_cache: QuantizedKeyValueCache,
+
+    pub cached_token_identifiers: Vec<u32>,
+}
+
+impl TransformerRuntimeState {
+    #[inline]
+    pub fn truncate_prompt_cache(&mut self, new_length: usize) {
+        self.cached_token_identifiers.truncate(new_length);
+    }
+
+    #[inline]
+    pub fn record_token_at_position(&mut self, token_identifier: u32, position: usize) {
+        if position < self.cached_token_identifiers.len() {
+            self.truncate_prompt_cache(position);
+        }
+
+        self.cached_token_identifiers.push(token_identifier);
+    }
 }
 
 pub struct Transformer {
@@ -70,6 +90,9 @@ pub struct Transformer {
 impl Transformer {
     // Single token forward
     pub fn forward(&mut self, token_identifier: u32, position: usize) -> Result<&[f32]> {
+        self.state
+            .record_token_at_position(token_identifier, position);
+
         let model_hidden_dimension = self.configuration.model_hidden_dimension as usize;
         let feed_forward_hidden_dimension =
             self.configuration.feed_forward_hidden_dimension as usize;
@@ -78,10 +101,8 @@ impl Transformer {
         let number_of_attention_heads = self.configuration.number_of_attention_heads as usize;
         let number_of_key_value_heads = self.configuration.number_of_key_value_heads as usize;
         let attention_head_dimension = self.configuration.attention_head_dimension as usize;
-        let maximum_sequence_length = self.configuration.maximum_sequence_length as usize;
 
         let attention_concatenated_dimension = number_of_attention_heads * attention_head_dimension;
-        let key_value_concatenated_dimension = number_of_key_value_heads * attention_head_dimension;
 
         let key_value_head_sharing_multiplier =
             number_of_attention_heads / number_of_key_value_heads;
@@ -228,7 +249,9 @@ impl Transformer {
 
                         attention_output_head.fill(0.0f32);
 
-                        for time_index in 0..=position {
+                        let limit = self.state.cached_token_identifiers.len();
+
+                        for time_index in 0..limit {
                             let (key_quantized, key_scales) = key_value_cache.key_head_at(
                                 layer_index,
                                 shared_key_value_head_index,
@@ -601,7 +624,7 @@ impl Transformer {
                 }
 
                 {
-                    let prefix_length = position;
+                    let prefix_length = position.min(self.state.cached_token_identifiers.len());
                     let block_size = current_batch_size;
 
                     let head_dimension = attention_head_dimension;
@@ -938,6 +961,73 @@ impl Transformer {
             position += current_batch_size;
 
             let _ = maximum_sequence_length;
+        }
+
+        Ok(&self.state.logits)
+    }
+
+    pub fn ingest_tokens_into_cache(
+        &mut self,
+        token_identifiers: &[u32],
+        start_position: usize,
+        batch_size: usize,
+    ) -> Result<(usize, Duration)> {
+        let start_prompt = Instant::now();
+
+        if token_identifiers.is_empty() {
+            return Ok((0, start_prompt.elapsed()));
+        }
+
+        let cached_length = self.state.cached_token_identifiers.len();
+
+        if start_position < cached_length {
+            let cached_token_identifierss = &self.state.cached_token_identifiers;
+
+            let overlap = (cached_length - start_position).min(token_identifiers.len());
+
+            for i in 0..overlap {
+                let position = start_position + i;
+
+                if position >= cached_token_identifierss.len()
+                    || cached_token_identifierss[position] != token_identifiers[i]
+                {
+                    self.batched_forward_recording(token_identifiers, start_position, batch_size)?;
+
+                    return Ok((token_identifiers.len(), start_prompt.elapsed()));
+                }
+            }
+
+            let suffix = &token_identifiers[overlap..];
+
+            if suffix.is_empty() {
+                return Ok((0, start_prompt.elapsed()));
+            }
+
+            let suffix_start_position = start_position + overlap;
+
+            self.batched_forward_recording(suffix, suffix_start_position, batch_size)?;
+
+            return Ok((suffix.len(), start_prompt.elapsed()));
+        }
+
+        self.batched_forward_recording(token_identifiers, start_position, batch_size)?;
+
+        Ok((token_identifiers.len(), start_prompt.elapsed()))
+    }
+
+    fn batched_forward_recording(
+        &mut self,
+        token_identifiers: &[u32],
+        start_position: usize,
+        batch_size: usize,
+    ) -> Result<&[f32]> {
+        {
+            let _ = self.batched_forward(token_identifiers, start_position, batch_size)?;
+        }
+
+        for (i, &token_identifier) in token_identifiers.iter().enumerate() {
+            self.state
+                .record_token_at_position(token_identifier, start_position + i);
         }
 
         Ok(&self.state.logits)

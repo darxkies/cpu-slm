@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 
 pub const UNKNOWN_TOKEN: &str = "<unk>";
@@ -455,5 +455,45 @@ impl BPETokenizer {
 
         String::from_utf8_lossy(&bytes).to_string()
     }
-}
 
+    pub fn decode_token_to_bytes(&self, id: u32) -> Vec<u8> {
+        match self.r#type {
+            TokenizerType::GPT2 => {
+                let token = self.decode_token(id);
+                let unicode_to_byte = self
+                    .gpt2_unicode_to_bytes
+                    .as_ref()
+                    .expect("missing gpt2 unicode_to_bytes mapping");
+
+                let mut result: Vec<u8> = Vec::with_capacity(token.len());
+
+                for char in token.chars() {
+                    if let Some(byte) = unicode_to_byte.get(&char) {
+                        result.push(*byte);
+                    } else {
+                        let mut buffer = [0u8; 4];
+
+                        let string = char.encode_utf8(&mut buffer);
+
+                        result.extend_from_slice(string.as_bytes());
+                    }
+                }
+
+                result
+            }
+            TokenizerType::LLAMA => {
+                let mut piece = self.decode_token(id);
+
+                piece = piece.replace('▁', " ");
+
+                if let Some(hex) = piece.strip_prefix("<0x").and_then(|v| v.strip_suffix('>')) {
+                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                        return vec![byte];
+                    }
+                }
+
+                piece.into_bytes()
+            }
+        }
+    }
+}
